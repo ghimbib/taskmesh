@@ -27,8 +27,10 @@ Most multi-agent AI systems bolt on task coordination as an afterthought: raw JS
 ## Install
 
 ```bash
-pip install git+https://github.com/ghimbib/taskmesh.git
+pip install taskmesh-py
 ```
+
+Import stays `taskmesh`. The PyPI distribution name is `taskmesh-py` because `taskmesh` is already taken on PyPI.
 
 For local development from source:
 

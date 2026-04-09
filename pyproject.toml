@@ -3,7 +3,7 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "taskmesh"
+name = "taskmesh-py"
 version = "0.1.0"
 description = "TaskMesh: an agent task queue protocol and Python reference implementation."
 readme = "README.md"
