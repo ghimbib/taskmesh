@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CLI entrypoint for agent-queue operations.
+CLI entrypoint for TaskMesh operations.
 
 Commands:
   add <queue> <task_id> <title> [options]
@@ -26,7 +26,7 @@ except ImportError:
 def main():
     """Main CLI entrypoint."""
     parser = argparse.ArgumentParser(
-        description="Agent queue task management",
+        description="TaskMesh task management",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 

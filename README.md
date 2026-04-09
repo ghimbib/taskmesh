@@ -2,9 +2,7 @@
 
 > An agent task queue protocol and Python reference implementation.
 
-TaskMesh is the project name. The repo and Python package remain `agent-queue` and `agent_queue` for clarity and installability.
-
-Most multi-agent AI systems bolt on task coordination as an afterthought: raw JSON writes, race conditions, inconsistent task schemas, and vague completion handling. `agent-queue` defines a simple portable protocol for agent task state and ships a reference Python implementation that is safe for concurrent local use.
+Most multi-agent AI systems bolt on task coordination as an afterthought: raw JSON writes, race conditions, inconsistent task schemas, and vague completion handling. `taskmesh` defines a simple portable protocol for agent task state and ships a reference Python implementation that is safe for concurrent local use.
 
 ---
 
@@ -29,7 +27,7 @@ Most multi-agent AI systems bolt on task coordination as an afterthought: raw JS
 ## Install
 
 ```bash
-pip install agent-queue
+pip install git+https://github.com/ghimbib/taskmesh.git
 ```
 
 For local development from source:
@@ -96,7 +94,7 @@ Valid routing actions:
 ### Convenience wrapper
 
 ```python
-from agent_queue import Queue
+from taskmesh import Queue
 
 q = Queue("./my-queue.json")
 
@@ -124,7 +122,7 @@ q.complete(
 ### Functional API
 
 ```python
-from agent_queue import add, claim, complete
+from taskmesh import add, claim, complete
 
 queue_path = "./my-queue.json"
 
@@ -152,32 +150,32 @@ complete(
 
 ```bash
 # Add a task
-agent-queue add ./queue.json task-001 "Do the thing" --priority P1 --queued-by orchestrator
+taskmesh add ./queue.json task-001 "Do the thing" --priority P1 --queued-by orchestrator
 
 # List tasks
-agent-queue list ./queue.json
-agent-queue list ./queue.json --status queued
+taskmesh list ./queue.json
+taskmesh list ./queue.json --status queued
 
 # Claim first queued task
-agent-queue claim ./queue.json --agent researcher
+taskmesh claim ./queue.json --agent researcher
 
 # Claim a specific task
-agent-queue claim ./queue.json task-001 --agent researcher
+taskmesh claim ./queue.json task-001 --agent researcher
 
 # Complete a task
-agent-queue complete ./queue.json task-001 \
+taskmesh complete ./queue.json task-001 \
   --summary "Done" \
   --routing review \
   --reason "Needs approval before next stage"
 
 # Fail a task
-agent-queue fail ./queue.json task-001 --error "Dependency unavailable"
+taskmesh fail ./queue.json task-001 --error "Dependency unavailable"
 
 # Retry a failed task
-agent-queue retry ./queue.json task-001
+taskmesh retry ./queue.json task-001
 
 # Show stale tasks
-agent-queue stale ./queue.json --days 3
+taskmesh stale ./queue.json --days 3
 ```
 
 ---

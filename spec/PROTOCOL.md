@@ -1,4 +1,4 @@
-# Agent Queue Protocol
+# TaskMesh Protocol
 
 > Version: 0.1-release-candidate
 > Status: Release candidate
@@ -7,7 +7,7 @@
 
 ## 1. Purpose
 
-The Agent Queue Protocol defines a minimal, portable task queue contract for multi-agent AI systems.
+The TaskMesh Protocol defines a minimal, portable task queue contract for multi-agent AI systems.
 
 It standardizes:
 - task schema

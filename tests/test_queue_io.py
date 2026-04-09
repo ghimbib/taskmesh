@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Unit tests for agent-queue reference implementation.
+Unit tests for TaskMesh reference implementation.
 
 Tests cover: add, dedup, claim, complete, fail, retry, list, stale detection,
 is_duplicate, concurrent lock safety, and full lifecycle.
@@ -13,7 +13,7 @@ import unittest
 from datetime import datetime, timezone, timedelta
 from multiprocessing import Process, Value
 
-from agent_queue import queue_io
+from taskmesh import queue_io
 
 
 # Top-level functions for multiprocessing (macOS spawn can't pickle closures)

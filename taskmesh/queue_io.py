@@ -3,7 +3,7 @@
 queue_io.py — Clean reference implementation for agent task queue operations.
 
 Provides atomic, file-lock-based operations on JSON queue files following the
-agent-queue protocol specification.
+TaskMesh protocol specification.
 
 Protocol:
 - Status sections: queued, in_progress, completed, failed

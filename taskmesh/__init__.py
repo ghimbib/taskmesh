@@ -1,5 +1,5 @@
 """
-agent-queue — Clean reference implementation for agent task queue operations.
+TaskMesh — Clean reference implementation for agent task queue operations.
 
 Public API for atomic, file-lock-based operations on JSON queue files.
 """
