@@ -1,6 +1,8 @@
-# agent-queue
+# TaskMesh
 
-> A minimal task queue protocol and Python reference implementation for multi-agent AI systems.
+> An agent task queue protocol and Python reference implementation.
+
+TaskMesh is the project name. The repo and Python package remain `agent-queue` and `agent_queue` for clarity and installability.
 
 Most multi-agent AI systems bolt on task coordination as an afterthought: raw JSON writes, race conditions, inconsistent task schemas, and vague completion handling. `agent-queue` defines a simple portable protocol for agent task state and ships a reference Python implementation that is safe for concurrent local use.
 
