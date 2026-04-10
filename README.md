@@ -1,26 +1,26 @@
 # TaskMesh
 
-> An agent task queue protocol and Python reference implementation.
+> An agent task queue protocol and SQLite reference implementation.
 
-Most multi-agent AI systems bolt on task coordination as an afterthought: raw JSON writes, race conditions, inconsistent task schemas, and vague completion handling. `taskmesh` defines a simple portable protocol for agent task state and ships a reference Python implementation that is safe for concurrent local use.
+Most multi-agent AI systems bolt on task coordination as an afterthought: ad hoc files, race conditions, inconsistent task schemas, and muddy completion handling. `taskmesh` defines a simple portable protocol for agent task state and ships a reference Python implementation backed by a single-file SQLite database.
 
 ---
 
 ## What it includes
 
-1. **Protocol spec** for task schema, lifecycle, locking, deduplication, and routing
-2. **Python reference implementation** with atomic file-locked writes
+1. **Protocol spec** for task schema, lifecycle, deduplication, retries, and completion routing
+2. **Python reference implementation** using SQLite transactions and WAL mode
 3. **CLI** for queue operations
-4. **Tests** covering lifecycle, retries, stale detection, and concurrent writes
+4. **Tests** covering lifecycle, retries, stale detection, and concurrent writers
 
 ---
 
 ## Design goals
 
-- **Portable**: file-based JSON queue, easy to inspect and adopt
-- **Safe**: lock-protected read-modify-write and atomic file replacement
+- **Portable**: single-file SQLite queue, easy to copy, inspect, and adopt
+- **Safe**: atomic state transitions with transaction boundaries
 - **Agent-native**: explicit task states, retry behavior, and routing declarations
-- **Minimal**: standard library only for the core implementation
+- **Minimal**: Python standard library only
 
 ---
 
@@ -42,18 +42,14 @@ python3 -m unittest discover -s tests -q
 
 ## Protocol overview
 
-### Queue file
+### Canonical storage
 
-```json
-{
-  "version": "1",
-  "agent": null,
-  "queued": [],
-  "in_progress": [],
-  "completed": [],
-  "failed": []
-}
-```
+TaskMesh stores queue state in a **SQLite database**.
+
+- one row per task
+- `status` determines the current section
+- SQLite metadata stores queue-level fields like `version` and `agent`
+- WAL mode is enabled for concurrent local access
 
 ### Task shape
 
@@ -98,7 +94,7 @@ Valid routing actions:
 ```python
 from taskmesh import Queue
 
-q = Queue("./my-queue.json")
+q = Queue("./my-queue.db")
 
 q.add({
     "id": "research-topic-001",
@@ -108,7 +104,6 @@ q.add({
     "queuedAt": "2026-04-06T16:00:00+00:00"
 })
 
-# Claim first queued task and persist claimant identity
 claimed = q.claim(agent="researcher")
 
 q.complete(
@@ -126,7 +121,7 @@ q.complete(
 ```python
 from taskmesh import add, claim, complete
 
-queue_path = "./my-queue.json"
+queue_path = "./my-queue.db"
 
 add(queue_path, {
     "id": "task-001",
@@ -146,51 +141,69 @@ complete(
 )
 ```
 
+### Read view
+
+`read_queue()` returns a grouped in-memory view for convenience:
+
+```python
+{
+  "version": "1",
+  "agent": None,
+  "queued": [...],
+  "in_progress": [...],
+  "completed": [...],
+  "failed": [...]
+}
+```
+
+That grouped structure is a read adapter, not the canonical on-disk format.
+
 ---
 
 ## CLI
 
 ```bash
 # Add a task
-taskmesh add ./queue.json task-001 "Do the thing" --priority P1 --queued-by orchestrator
+taskmesh add ./queue.db task-001 "Do the thing" --priority P1 --queued-by orchestrator
 
 # List tasks
-taskmesh list ./queue.json
-taskmesh list ./queue.json --status queued
+taskmesh list ./queue.db
+taskmesh list ./queue.db --status queued
 
 # Claim first queued task
-taskmesh claim ./queue.json --agent researcher
+taskmesh claim ./queue.db --agent researcher
 
 # Claim a specific task
-taskmesh claim ./queue.json task-001 --agent researcher
+taskmesh claim ./queue.db task-001 --agent researcher
 
 # Complete a task
-taskmesh complete ./queue.json task-001 \
+taskmesh complete ./queue.db task-001 \
   --summary "Done" \
   --routing review \
   --reason "Needs approval before next stage"
 
 # Fail a task
-taskmesh fail ./queue.json task-001 --error "Dependency unavailable"
+taskmesh fail ./queue.db task-001 --error "Dependency unavailable"
 
 # Retry a failed task
-taskmesh retry ./queue.json task-001
+taskmesh retry ./queue.db task-001
 
 # Show stale tasks
-taskmesh stale ./queue.json --days 3
+taskmesh stale ./queue.db --days 3
 ```
 
 ---
 
 ## Behavior guarantees
 
-- Tasks live in exactly one section at a time
+- Tasks live in exactly one status at a time
 - State transitions are atomic
-- Duplicate task IDs are blocked across all sections by default
+- Duplicate task IDs are blocked across all statuses by default
 - Explicit re-queue is supported when requested by the caller
 - Completed tasks require structured routing metadata
 - Claim operations record timestamps and may record claimant identity
 - Retry clears completion-only fields before re-queueing
+- SQLite WAL mode is enabled for concurrent local writers
 
 ---
 
@@ -202,6 +215,7 @@ Current release candidate includes:
 - routing stored as structured task metadata
 - concurrent write tests
 - retry and stale detection coverage
+- SQLite as the canonical backend
 
 ---
 
@@ -209,7 +223,7 @@ Current release candidate includes:
 
 - package metadata and PyPI publishing
 - more worked examples
-- optional SQLite backend
+- migration helpers for older file-based prototypes
 - TypeScript port
 
 ---

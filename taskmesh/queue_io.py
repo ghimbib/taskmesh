@@ -1,180 +1,150 @@
 #!/usr/bin/env python3
 """
-queue_io.py — Clean reference implementation for agent task queue operations.
+queue_io.py — SQLite-backed reference implementation for TaskMesh.
 
-Provides atomic, file-lock-based operations on JSON queue files following the
+Provides atomic operations on a single-file SQLite database following the
 TaskMesh protocol specification.
 
 Protocol:
 - Status sections: queued, in_progress, completed, failed
 - Methods: claim(), complete(), fail(), retry()
 - Task required fields: id, title, status, queuedBy, queuedAt
-- File locking: fcntl.flock(LOCK_EX) for all writes
+- Storage: SQLite database with WAL mode
 - Deduplication: check all sections unless explicit re-queue is requested
 """
 
 import json
-import fcntl
 import os
-import tempfile
+import sqlite3
 from datetime import datetime, timezone, timedelta
-from typing import Dict, List, Optional, Any, Callable
+from typing import Any, Callable, Dict, List, Optional
 
 VALID_STATUSES = {"queued", "in_progress", "completed", "failed"}
 VALID_ROUTING_ACTIONS = {"archive", "qa-gate", "review", "escalate"}
+TERMINAL_STATUSES = {"completed", "failed"}
+STATUS_ORDER = ("queued", "in_progress", "completed", "failed")
+
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS metadata (
+    key TEXT PRIMARY KEY,
+    value TEXT
+);
+
+CREATE TABLE IF NOT EXISTS tasks (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('queued', 'in_progress', 'completed', 'failed')),
+    priority TEXT,
+    queued_by TEXT,
+    queued_at TEXT,
+    context TEXT,
+    deliverable TEXT,
+    depends_on TEXT,
+    gate_condition TEXT,
+    started_at TEXT,
+    claimed_by TEXT,
+    completed_at TEXT,
+    last_activity TEXT,
+    stale_days INTEGER,
+    retry_count INTEGER,
+    max_retries INTEGER,
+    result TEXT,
+    error TEXT,
+    routing_action TEXT,
+    routing_reason TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+CREATE INDEX IF NOT EXISTS idx_tasks_status_queued_at ON tasks(status, queued_at);
+"""
 
 
 def read_queue(queue_path: str) -> Dict[str, List[Dict[str, Any]]]:
-    """
-    Read queue state with shared lock.
-
-    Returns dict with sections: queued, in_progress, completed, failed.
-    Creates empty structure if file doesn't exist.
-    """
-    lock_path = _ensure_lock_file(queue_path)
-    with open(lock_path, "w") as lock_fd:
-        fcntl.flock(lock_fd, fcntl.LOCK_SH)
-        try:
-            with open(queue_path) as f:
-                q = json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            return _empty_queue()
-
-        # Ensure all required sections exist
-        for section in ["queued", "in_progress", "completed", "failed"]:
-            if section not in q:
-                q[section] = []
-
-        return q
+    """Read queue state from SQLite."""
+    try:
+        with _connect(queue_path) as conn:
+            return _read_queue_from_conn(conn)
+    except sqlite3.DatabaseError:
+        return _empty_queue()
 
 
 def update_queue(queue_path: str, updater_fn: Callable[[Dict], None]) -> Dict:
     """
-    Atomic read-modify-write with exclusive lock.
+    Compatibility helper: read queue view, mutate in memory, then replace DB state.
 
-    Args:
-        queue_path: Path to queue JSON file
-        updater_fn: Function that receives queue dict and modifies it in place
-
-    Returns:
-        Updated queue dict
+    This preserves the previous public escape hatch while keeping SQLite as the
+    canonical backend.
     """
-    lock_path = _ensure_lock_file(queue_path)
-    with open(lock_path, "w") as lock_fd:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
-
-        # Read current state
-        try:
-            with open(queue_path) as f:
-                q = json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            q = _empty_queue()
-
-        # Ensure structure
-        if not isinstance(q, dict):
-            q = _empty_queue()
-        for section in ["queued", "in_progress", "completed", "failed"]:
-            if section not in q:
-                q[section] = []
-
-        # Apply update
+    with _connect(queue_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        q = _read_queue_from_conn(conn)
         updater_fn(q)
-
-        # Write atomically
-        _write_atomic(queue_path, q)
-
-    return q
+        _replace_all_from_dict(conn, q)
+        conn.commit()
+        return q
 
 
 def add(queue_path: str, task: Dict[str, Any], *, allow_requeue: bool = False) -> bool:
-    """
-    Add task to queue with deduplication.
-
-    By default checks all sections for duplicate task IDs. To explicitly re-queue
-    a previously completed or failed task, pass allow_requeue=True.
-
-    Args:
-        queue_path: Path to queue JSON file
-        task: Task dict with at least: id, title, status, queuedBy, queuedAt
-        allow_requeue: Allow re-adding when matching ID exists in completed/failed
-
-    Returns:
-        True if added, False if duplicate
-    """
+    """Add task to queue with deduplication."""
     _validate_task_for_add(task)
     task = dict(task)
-    task_id = task["id"]
-
-    # Ensure required/default fields
     task.setdefault("status", "queued")
     task.setdefault("queuedAt", _now_iso())
 
     if task["status"] != "queued":
         raise ValueError("Newly added tasks must have status 'queued'")
 
-    added = False
+    with _connect(queue_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        existing = _get_task(conn, task["id"])
+        if existing is not None:
+            if not allow_requeue or existing.get("status") not in TERMINAL_STATUSES:
+                conn.rollback()
+                return False
+            conn.execute("DELETE FROM tasks WHERE id = ?", (task["id"],))
 
-    def _add(q: Dict) -> None:
-        nonlocal added
-        sections = ["queued", "in_progress"]
-        if not allow_requeue:
-            sections.extend(["completed", "failed"])
-
-        for section in sections:
-            for existing in q.get(section, []):
-                if existing.get("id") == task_id:
-                    added = False
-                    return
-
-        q["queued"].append(task)
-        added = True
-
-    update_queue(queue_path, _add)
-    return added
+        _insert_task(conn, task)
+        conn.commit()
+        return True
 
 
 def claim(queue_path: str, task_id: Optional[str] = None, *, agent: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    """
-    Transition task from queued to in_progress.
+    """Transition task from queued to in_progress."""
+    with _connect(queue_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
 
-    Sets startedAt, lastActivity, and optionally claimedBy.
-    If task_id is omitted, claims the first queued task.
+        if task_id is None:
+            row = conn.execute(
+                """
+                SELECT * FROM tasks
+                WHERE status = 'queued'
+                ORDER BY CASE WHEN queued_at IS NULL THEN 1 ELSE 0 END, queued_at, rowid
+                LIMIT 1
+                """
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT * FROM tasks WHERE id = ? AND status = 'queued'",
+                (task_id,),
+            ).fetchone()
 
-    Args:
-        queue_path: Path to queue JSON file
-        task_id: Task ID to claim, or first queued task when omitted
-        agent: Optional claimant identity to persist as claimedBy
+        if row is None:
+            conn.rollback()
+            return None
 
-    Returns:
-        Claimed task dict, or None if not found
-    """
-    claimed_task = None
-
-    def _claim(q: Dict) -> None:
-        nonlocal claimed_task
-
-        selected_index = None
-        for i, task in enumerate(q["queued"]):
-            if task_id is None or task.get("id") == task_id:
-                selected_index = i
-                break
-
-        if selected_index is None:
-            return
-
-        task = q["queued"].pop(selected_index)
         now = _now_iso()
-        task["status"] = "in_progress"
-        task["startedAt"] = now
-        task["lastActivity"] = now
-        if agent:
-            task["claimedBy"] = agent
+        conn.execute(
+            """
+            UPDATE tasks
+            SET status = 'in_progress', started_at = ?, last_activity = ?, claimed_by = ?
+            WHERE id = ? AND status = 'queued'
+            """,
+            (now, now, agent, row["id"]),
+        )
 
-        q["in_progress"].append(task)
-        claimed_task = task
-
-    update_queue(queue_path, _claim)
-    return claimed_task
+        task = _get_task(conn, row["id"])
+        conn.commit()
+        return task
 
 
 def complete(
@@ -183,271 +153,369 @@ def complete(
     result: str = "",
     routing: Optional[Dict[str, str]] = None,
 ) -> Optional[Dict[str, Any]]:
-    """
-    Transition task from in_progress to completed.
-
-    Sets completedAt timestamp, optional result field, and required routing.
-
-    Args:
-        queue_path: Path to queue JSON file
-        task_id: Task ID to complete
-        result: Completion result or message
-        routing: Required routing declaration dict with action + reason
-
-    Returns:
-        Completed task dict, or None if not found
-    """
+    """Transition task from in_progress to completed."""
     if routing is None:
         raise ValueError("Completed tasks must include routing")
     _validate_routing(routing)
 
-    completed_task = None
+    with _connect(queue_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM tasks WHERE id = ? AND status = 'in_progress'",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            conn.rollback()
+            return None
 
-    def _complete(q: Dict) -> None:
-        nonlocal completed_task
-
-        for i, task in enumerate(q["in_progress"]):
-            if task.get("id") == task_id:
-                task = q["in_progress"].pop(i)
-                now = _now_iso()
-                task["status"] = "completed"
-                task["completedAt"] = now
-                task["lastActivity"] = now
-                task["routing"] = dict(routing)
-                if result:
-                    task["result"] = result
-                q["completed"].append(task)
-                completed_task = task
-                break
-
-    update_queue(queue_path, _complete)
-    return completed_task
+        now = _now_iso()
+        conn.execute(
+            """
+            UPDATE tasks
+            SET status = 'completed',
+                completed_at = ?,
+                last_activity = ?,
+                result = ?,
+                routing_action = ?,
+                routing_reason = ?
+            WHERE id = ?
+            """,
+            (
+                now,
+                now,
+                result or None,
+                routing["action"],
+                routing["reason"].strip(),
+                task_id,
+            ),
+        )
+        task = _get_task(conn, task_id)
+        conn.commit()
+        return task
 
 
 def fail(queue_path: str, task_id: str, error: str = "") -> Optional[Dict[str, Any]]:
-    """
-    Transition task from in_progress to failed.
+    """Transition task from in_progress to failed."""
+    with _connect(queue_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM tasks WHERE id = ? AND status = 'in_progress'",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            conn.rollback()
+            return None
 
-    Sets completedAt timestamp and error field.
-
-    Args:
-        queue_path: Path to queue JSON file
-        task_id: Task ID to fail
-        error: Error message
-
-    Returns:
-        Failed task dict, or None if not found
-    """
-    failed_task = None
-
-    def _fail(q: Dict) -> None:
-        nonlocal failed_task
-
-        # Find task in in_progress
-        for i, task in enumerate(q["in_progress"]):
-            if task.get("id") == task_id:
-                # Remove from in_progress
-                task = q["in_progress"].pop(i)
-
-                # Update status and timestamps
-                task["status"] = "failed"
-                task["completedAt"] = _now_iso()
-                task["lastActivity"] = _now_iso()
-                if error:
-                    task["error"] = error
-
-                # Add to failed
-                q["failed"].append(task)
-                failed_task = task
-                break
-
-    update_queue(queue_path, _fail)
-    return failed_task
+        now = _now_iso()
+        conn.execute(
+            """
+            UPDATE tasks
+            SET status = 'failed',
+                completed_at = ?,
+                last_activity = ?,
+                error = ?
+            WHERE id = ?
+            """,
+            (now, now, error or None, task_id),
+        )
+        task = _get_task(conn, task_id)
+        conn.commit()
+        return task
 
 
 def retry(queue_path: str, task_id: str) -> Optional[Dict[str, Any]]:
-    """
-    Transition task from failed back to queued for retry.
+    """Transition task from failed back to queued for retry."""
+    with _connect(queue_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        task = _get_task(conn, task_id)
+        if task is None or task.get("status") != "failed":
+            conn.rollback()
+            return None
 
-    Increments retryCount and checks against maxRetries.
+        retry_count = task.get("retryCount", 0)
+        max_retries = task.get("maxRetries", 3)
+        if retry_count >= max_retries:
+            conn.rollback()
+            return None
 
-    Args:
-        queue_path: Path to queue JSON file
-        task_id: Task ID to retry
-
-    Returns:
-        Retried task dict, or None if not found or max retries exceeded
-    """
-    retried_task = None
-
-    def _retry(q: Dict) -> None:
-        nonlocal retried_task
-
-        # Find task in failed
-        for i, task in enumerate(q["failed"]):
-            if task.get("id") == task_id:
-                # Check retry limit
-                retry_count = task.get("retryCount", 0)
-                max_retries = task.get("maxRetries", 3)
-
-                if retry_count >= max_retries:
-                    return  # Max retries exceeded
-
-                # Remove from failed
-                task = q["failed"].pop(i)
-
-                # Update for retry
-                task["status"] = "queued"
-                task["retryCount"] = retry_count + 1
-                task["lastActivity"] = _now_iso()
-
-                # Remove completion fields
-                task.pop("completedAt", None)
-                task.pop("error", None)
-                task.pop("result", None)
-                task.pop("routing", None)
-                task.pop("startedAt", None)
-                task.pop("claimedBy", None)
-
-                # Add to queued
-                q["queued"].append(task)
-                retried_task = task
-                break
-
-    update_queue(queue_path, _retry)
-    return retried_task
+        now = _now_iso()
+        conn.execute(
+            """
+            UPDATE tasks
+            SET status = 'queued',
+                retry_count = ?,
+                last_activity = ?,
+                started_at = NULL,
+                claimed_by = NULL,
+                completed_at = NULL,
+                result = NULL,
+                error = NULL,
+                routing_action = NULL,
+                routing_reason = NULL
+            WHERE id = ?
+            """,
+            (retry_count + 1, now, task_id),
+        )
+        retried = _get_task(conn, task_id)
+        conn.commit()
+        return retried
 
 
 def list_tasks(queue_path: str, status: Optional[str] = None) -> List[Dict[str, Any]]:
-    """
-    List all tasks, optionally filtered by status.
+    """List all tasks, optionally filtered by status."""
+    with _connect(queue_path) as conn:
+        if status:
+            rows = conn.execute(
+                "SELECT * FROM tasks WHERE status = ? ORDER BY rowid",
+                (status,),
+            ).fetchall()
+            return [_row_to_task(row) for row in rows]
 
-    Args:
-        queue_path: Path to queue JSON file
-        status: Filter by status section (queued, in_progress, completed, failed)
-
-    Returns:
-        List of task dicts
-    """
-    q = read_queue(queue_path)
-
-    if status:
-        return q.get(status, [])
-
-    # Return all tasks
-    tasks = []
-    for section in ["queued", "in_progress", "completed", "failed"]:
-        tasks.extend(q.get(section, []))
-    return tasks
+        rows = conn.execute("SELECT * FROM tasks ORDER BY rowid").fetchall()
+        return [_row_to_task(row) for row in rows]
 
 
 def is_stale(task: Dict[str, Any], days: int = 3) -> bool:
-    """
-    Check if in_progress task is stale based on lastActivity.
-
-    Args:
-        task: Task dict
-        days: Number of days before considering stale
-
-    Returns:
-        True if stale, False otherwise
-    """
+    """Check if in_progress task is stale based on lastActivity."""
     if task.get("status") != "in_progress":
         return False
 
-    last_activity = task.get("lastActivity")
-    if not last_activity:
-        # No lastActivity, check startedAt
-        last_activity = task.get("startedAt")
-
+    last_activity = task.get("lastActivity") or task.get("startedAt")
     if not last_activity:
         return False
 
     try:
         last_dt = datetime.fromisoformat(last_activity.replace("Z", "+00:00"))
-        now = datetime.now(timezone.utc)
-        age = now - last_dt
+        age = datetime.now(timezone.utc) - last_dt
         return age > timedelta(days=days)
     except (ValueError, AttributeError):
         return False
 
 
 def is_duplicate(queue_path: str, task_id: str, *, include_terminal: bool = True) -> bool:
-    """
-    Check if task ID already exists in queue sections.
-
-    Args:
-        queue_path: Path to queue JSON file
-        task_id: Task ID to check
-        include_terminal: When True, also check completed and failed sections
-
-    Returns:
-        True if duplicate, False otherwise
-    """
-    q = read_queue(queue_path)
-
-    sections = ["queued", "in_progress"]
-    if include_terminal:
-        sections.extend(["completed", "failed"])
-
-    for section in sections:
-        for task in q.get(section, []):
-            if task.get("id") == task_id:
-                return True
-
-    return False
+    """Check if task ID already exists in queue sections."""
+    with _connect(queue_path) as conn:
+        if include_terminal:
+            row = conn.execute("SELECT 1 FROM tasks WHERE id = ? LIMIT 1", (task_id,)).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT 1 FROM tasks WHERE id = ? AND status IN ('queued', 'in_progress') LIMIT 1",
+                (task_id,),
+            ).fetchone()
+        return row is not None
 
 
 # Private helpers
 
 def _empty_queue() -> Dict[str, List]:
-    """Create empty queue structure."""
     return {
         "version": "1",
         "agent": None,
         "queued": [],
         "in_progress": [],
         "completed": [],
-        "failed": []
+        "failed": [],
     }
 
 
-def _ensure_lock_file(queue_path: str) -> str:
-    """Ensure lock file exists and return its path."""
-    lock_path = queue_path + ".lock"
-    if not os.path.exists(lock_path):
-        open(lock_path, "a").close()
-    return lock_path
+def _connect(queue_path: str) -> sqlite3.Connection:
+    os.makedirs(os.path.dirname(queue_path) or ".", exist_ok=True)
+    return _open_db(queue_path, recover=True)
 
 
-def _write_atomic(queue_path: str, data: Dict) -> None:
-    """Write JSON to file via atomic temp+rename."""
-    if not isinstance(data, dict):
-        raise TypeError(f"Queue data must be dict, got {type(data).__name__}")
+def _open_db(queue_path: str, recover: bool) -> sqlite3.Connection:
+    def _connect_once() -> sqlite3.Connection:
+        conn = sqlite3.connect(queue_path, timeout=30, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=10000")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.executescript(SCHEMA_SQL)
+        conn.execute("INSERT OR IGNORE INTO metadata(key, value) VALUES ('version', '1')")
+        conn.execute("INSERT OR IGNORE INTO metadata(key, value) VALUES ('agent', NULL)")
+        return conn
 
-    dir_name = os.path.dirname(queue_path) or "."
-    fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp", prefix=".queue-")
     try:
-        with os.fdopen(fd, "w") as f:
-            json.dump(data, f, indent=2)
-            f.write("\n")
-        os.rename(tmp_path, queue_path)  # atomic on same filesystem
-    except Exception:
+        return _connect_once()
+    except sqlite3.DatabaseError:
+        if not recover:
+            raise
         try:
-            os.unlink(tmp_path)
-        except OSError:
+            os.unlink(queue_path)
+        except FileNotFoundError:
             pass
-        raise
+        return _connect_once()
+
+
+def _read_queue_from_conn(conn: sqlite3.Connection) -> Dict[str, List[Dict[str, Any]]]:
+    q = _empty_queue()
+    metadata = dict(conn.execute("SELECT key, value FROM metadata").fetchall())
+    q["version"] = metadata.get("version") or "1"
+    q["agent"] = metadata.get("agent")
+
+    rows = conn.execute(
+        "SELECT * FROM tasks ORDER BY CASE status WHEN 'queued' THEN 0 WHEN 'in_progress' THEN 1 WHEN 'completed' THEN 2 ELSE 3 END, rowid"
+    ).fetchall()
+    for row in rows:
+        task = _row_to_task(row)
+        q[task["status"]].append(task)
+    return q
+
+
+def _replace_all_from_dict(conn: sqlite3.Connection, q: Dict[str, Any]) -> None:
+    q = dict(q)
+    version = str(q.get("version", "1"))
+    agent = q.get("agent")
+
+    conn.execute("DELETE FROM tasks")
+    conn.execute("REPLACE INTO metadata(key, value) VALUES ('version', ?)", (version,))
+    conn.execute("REPLACE INTO metadata(key, value) VALUES ('agent', ?)", (agent,))
+
+    for status in STATUS_ORDER:
+        for task in q.get(status, []):
+            task = dict(task)
+            task["status"] = status
+            _validate_task_for_add(task)
+            _insert_task(conn, task)
+
+
+def _insert_task(conn: sqlite3.Connection, task: Dict[str, Any]) -> None:
+    record = _task_to_record(task)
+    conn.execute(
+        """
+        INSERT INTO tasks (
+            id, title, status, priority, queued_by, queued_at,
+            context, deliverable, depends_on, gate_condition,
+            started_at, claimed_by, completed_at, last_activity,
+            stale_days, retry_count, max_retries, result, error,
+            routing_action, routing_reason
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            record["id"],
+            record["title"],
+            record["status"],
+            record["priority"],
+            record["queued_by"],
+            record["queued_at"],
+            record["context"],
+            record["deliverable"],
+            record["depends_on"],
+            record["gate_condition"],
+            record["started_at"],
+            record["claimed_by"],
+            record["completed_at"],
+            record["last_activity"],
+            record["stale_days"],
+            record["retry_count"],
+            record["max_retries"],
+            record["result"],
+            record["error"],
+            record["routing_action"],
+            record["routing_reason"],
+        ),
+    )
+
+
+def _get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Dict[str, Any]]:
+    row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    return _row_to_task(row) if row else None
+
+
+def _task_to_record(task: Dict[str, Any]) -> Dict[str, Any]:
+    status = task.get("status", "queued")
+    if status not in VALID_STATUSES:
+        raise ValueError(f"Invalid task status: {status}")
+
+    routing = task.get("routing")
+    routing_action = None
+    routing_reason = None
+    if routing is not None:
+        _validate_routing(routing)
+        routing_action = routing["action"]
+        routing_reason = routing["reason"].strip()
+
+    depends_on = task.get("dependsOn")
+    if depends_on is not None and not isinstance(depends_on, list):
+        raise ValueError("dependsOn must be a list when provided")
+
+    return {
+        "id": task["id"],
+        "title": task["title"],
+        "status": status,
+        "priority": task.get("priority"),
+        "queued_by": task.get("queuedBy"),
+        "queued_at": task.get("queuedAt"),
+        "context": task.get("context"),
+        "deliverable": task.get("deliverable"),
+        "depends_on": json.dumps(depends_on) if depends_on is not None else None,
+        "gate_condition": task.get("gateCondition"),
+        "started_at": task.get("startedAt"),
+        "claimed_by": task.get("claimedBy"),
+        "completed_at": task.get("completedAt"),
+        "last_activity": task.get("lastActivity"),
+        "stale_days": task.get("staleDays"),
+        "retry_count": task.get("retryCount", 0),
+        "max_retries": task.get("maxRetries"),
+        "result": task.get("result"),
+        "error": task.get("error"),
+        "routing_action": routing_action,
+        "routing_reason": routing_reason,
+    }
+
+
+def _row_to_task(row: sqlite3.Row) -> Dict[str, Any]:
+    task: Dict[str, Any] = {
+        "id": row["id"],
+        "title": row["title"],
+        "status": row["status"],
+    }
+
+    mapping = {
+        "priority": "priority",
+        "queued_by": "queuedBy",
+        "queued_at": "queuedAt",
+        "context": "context",
+        "deliverable": "deliverable",
+        "gate_condition": "gateCondition",
+        "started_at": "startedAt",
+        "claimed_by": "claimedBy",
+        "completed_at": "completedAt",
+        "last_activity": "lastActivity",
+        "stale_days": "staleDays",
+        "max_retries": "maxRetries",
+        "result": "result",
+        "error": "error",
+    }
+
+    for column, key in mapping.items():
+        value = row[column]
+        if value is not None:
+            task[key] = value
+
+    if row["queued_by"] is not None:
+        task["queuedBy"] = row["queued_by"]
+    if row["retry_count"] not in (None, 0):
+        task["retryCount"] = row["retry_count"]
+
+    if row["depends_on"]:
+        task["dependsOn"] = json.loads(row["depends_on"])
+
+    if row["routing_action"] is not None:
+        task["routing"] = {
+            "action": row["routing_action"],
+            "reason": row["routing_reason"],
+        }
+
+    return task
 
 
 def _now_iso() -> str:
-    """Return current UTC timestamp in ISO format."""
     return datetime.now(timezone.utc).isoformat()
 
 
 def _validate_task_for_add(task: Dict[str, Any]) -> None:
-    required = ["id", "title"]
-    for field in required:
+    for field in ("id", "title"):
         if not task.get(field):
             raise ValueError(f"Task must have '{field}' field")
 
