@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-Unit tests for TaskMesh reference implementation.
+Unit tests for the TaskMesh SQLite reference implementation.
 
 Tests cover: add, dedup, claim, complete, fail, retry, list, stale detection,
-is_duplicate, concurrent lock safety, and full lifecycle.
+is_duplicate, concurrent write safety, and full lifecycle.
 """
 
-import json
 import os
 import tempfile
 import unittest
@@ -38,11 +37,16 @@ def _mp_add_dup(qpath, counter):
 
 
 def _make_queue(tmpdir, initial=None):
-    """Create a queue file with optional initial data."""
-    path = os.path.join(tmpdir, "test-queue.json")
-    data = initial or queue_io._empty_queue()
-    with open(path, "w") as f:
-        json.dump(data, f)
+    """Create a queue database with optional initial data."""
+    path = os.path.join(tmpdir, "test-queue.db")
+    if initial is None:
+        queue_io.read_queue(path)
+    else:
+        def _seed(q):
+            q.clear()
+            q.update(queue_io._empty_queue())
+            q.update(initial)
+        queue_io.update_queue(path, _seed)
     return path
 
 
@@ -87,7 +91,7 @@ class TestAdd(unittest.TestCase):
             queue_io.add(self.qpath, {"title": "No ID"})
 
     def test_add_creates_file(self):
-        new_path = os.path.join(self.tmpdir, "new-queue.json")
+        new_path = os.path.join(self.tmpdir, "new-queue.db")
         task = _make_task()
         queue_io.add(new_path, task)
         self.assertTrue(os.path.exists(new_path))
@@ -519,11 +523,15 @@ class TestFullLifecycle(unittest.TestCase):
     def test_queue_file_version(self):
         """Queue preserves version field."""
         tmpdir = tempfile.mkdtemp()
-        qpath = os.path.join(tmpdir, "versioned.json")
+        qpath = os.path.join(tmpdir, "versioned.db")
         initial = {"version": "1", "agent": "test", "queued": [], "in_progress": [], "completed": [], "failed": []}
-        with open(qpath, "w") as f:
-            json.dump(initial, f)
 
+        def _seed(q):
+            q.clear()
+            q.update(queue_io._empty_queue())
+            q.update(initial)
+
+        queue_io.update_queue(qpath, _seed)
         queue_io.add(qpath, _make_task("ver-001"))
         q = queue_io.read_queue(qpath)
         self.assertEqual(q.get("version"), "1")

@@ -1,6 +1,6 @@
 # TaskMesh Protocol
 
-> Version: 0.1-release-candidate
+> Version: 0.2-release-candidate
 > Status: Release candidate
 
 ---
@@ -11,13 +11,13 @@ The TaskMesh Protocol defines a minimal, portable task queue contract for multi-
 
 It standardizes:
 - task schema
-- queue file layout
+- SQLite storage expectations
 - state transitions
-- locking expectations
 - deduplication behavior
 - routing declarations on completion
+- stale-task detection inputs
 
-The goal is to provide a queue format and reference behavior that can be adopted by orchestrators, agents, or lightweight local runtimes without depending on external queue infrastructure.
+The goal is to provide a queue contract that can be adopted by orchestrators, agents, or lightweight local runtimes without requiring external queue infrastructure.
 
 ---
 
@@ -71,7 +71,25 @@ Valid `routing.action` values:
 
 ---
 
-## 3. Queue File Format
+## 3. Canonical Storage Format
+
+TaskMesh uses **SQLite as the canonical backend**.
+
+### Required storage rules
+- A queue is represented by a single SQLite database file.
+- A task MUST exist in exactly one status at a time.
+- Status is stored as task row state, not as duplicated copies of the same task.
+- Queue-level metadata such as `version` and `agent` MUST be persisted in SQLite metadata.
+- Implementations MUST treat SQLite as the source of truth.
+
+### Required SQLite behavior
+- WAL mode SHOULD be enabled for concurrent local access.
+- Writes MUST happen inside explicit transaction boundaries.
+- Implementations MUST NOT split one logical state transition across multiple commits.
+- Implementations MUST NOT rely on raw sidecar files as the canonical queue state.
+
+### Logical queue view
+Implementations MAY expose a grouped read adapter like this:
 
 ```json
 {
@@ -84,11 +102,7 @@ Valid `routing.action` values:
 }
 ```
 
-### Rules
-- A task MUST exist in exactly one section at a time
-- Queue files SHOULD include `version`
-- Queue files MAY include `agent` as descriptive metadata for a queue owner or lane
-- Missing sections MUST be treated as empty by compliant implementations
+That grouped view is an API convenience, not the canonical on-disk format.
 
 ---
 
@@ -121,19 +135,20 @@ failed -> queued      (retry)
 
 ---
 
-## 5. Locking Protocol
+## 5. Concurrency Contract
 
-All queue writes MUST use file locking to prevent race conditions and lost updates.
+All queue writes MUST be concurrency-safe.
 
 ### Required Behavior
-- Lock scope MUST cover read -> modify -> write as one critical section
-- Implementations MUST write atomically, for example temp file + rename on the same filesystem
-- Implementations MUST NOT hold locks across network calls, LLM calls, or unrelated I/O
+- Transaction scope MUST cover read -> validate -> mutate as one critical section.
+- Implementations MUST prevent lost updates and duplicate claims under concurrent writers.
+- Implementations MUST NOT hold transactions across network calls, LLM calls, or unrelated I/O.
 
 ### Reference Approach
-On POSIX systems, the reference implementation uses:
-- lock file + `fcntl.flock()`
-- temp file write + atomic rename
+The reference implementation uses:
+- SQLite transactions
+- WAL mode
+- a busy timeout for local contention
 
 ---
 
@@ -142,7 +157,7 @@ On POSIX systems, the reference implementation uses:
 Before inserting a task, a compliant queue MUST check whether the same task ID already exists.
 
 ### Default Rule
-A task ID is considered duplicate if it appears in any section:
+A task ID is considered duplicate if it already exists in any status:
 - `queued`
 - `in_progress`
 - `completed`
@@ -182,17 +197,6 @@ When a task is completed, the queue entry MUST store a structured routing object
 | `qa-gate` | Send to verification or QA step |
 | `review` | Send to reviewer, orchestrator, or approver |
 | `escalate` | Human or orchestrator attention required |
-
-### Optional Text Adapter
-Systems MAY additionally render the routing object into a text footer such as:
-
-```text
-[ROUTING]
-action: review
-reason: Requires human approval before downstream work
-```
-
-That footer is an adapter format for logs or messages. The canonical protocol representation is the structured `routing` object on the task.
 
 ---
 
@@ -238,9 +242,13 @@ A compliant Python implementation may expose both:
 ### Convenience Wrapper
 A higher-level `Queue` object MAY wrap the same behavior for easier use.
 
+### Optional Read Adapter
+Implementations MAY expose a grouped `read_queue()` view for human inspection or compatibility helpers.
+
 ---
 
 ## Changelog
 
+- `0.2-release-candidate` (2026-04-09) — Canonicalized SQLite as the sole backend, retained grouped read adapter, and aligned concurrency language with transactional storage
 - `0.1-release-candidate` (2026-04-06) — Canonicalized routing object, claim metadata, dedup semantics, and reference API
 - `0.1-draft` (2026-04-01) — Initial spec draft

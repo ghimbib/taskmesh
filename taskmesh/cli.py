@@ -3,13 +3,13 @@
 CLI entrypoint for TaskMesh operations.
 
 Commands:
-  add <queue> <task_id> <title> [options]
-  list <queue> [--status <status>]
-  claim <queue> [task_id] [--agent <agent>]
-  complete <queue> <task_id> [--summary <summary>] --routing <action> --reason <reason>
-  fail <queue> <task_id> [--error <error>]
-  retry <queue> <task_id>
-  stale <queue> [--days <days>]
+  add <queue_db> <task_id> <title> [options]
+  list <queue_db> [--status <status>]
+  claim <queue_db> [task_id] [--agent <agent>]
+  complete <queue_db> <task_id> [--summary <summary>] --routing <action> --reason <reason>
+  fail <queue_db> <task_id> [--error <error>]
+  retry <queue_db> <task_id>
+  stale <queue_db> [--days <days>]
 """
 
 import argparse
@@ -26,7 +26,7 @@ except ImportError:
 def main():
     """Main CLI entrypoint."""
     parser = argparse.ArgumentParser(
-        description="TaskMesh task management",
+        description="TaskMesh SQLite task queue management",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
@@ -34,7 +34,7 @@ def main():
 
     # add command
     add_parser = subparsers.add_parser("add", help="Add task to queue")
-    add_parser.add_argument("queue", help="Path to queue file")
+    add_parser.add_argument("queue", help="Path to queue SQLite database")
     add_parser.add_argument("task_id", help="Task ID")
     add_parser.add_argument("title", help="Task title")
     add_parser.add_argument("--priority", choices=["P0", "P1", "P2", "P3"], help="Priority")
@@ -46,7 +46,7 @@ def main():
 
     # list command
     list_parser = subparsers.add_parser("list", help="List tasks")
-    list_parser.add_argument("queue", help="Path to queue file")
+    list_parser.add_argument("queue", help="Path to queue SQLite database")
     list_parser.add_argument(
         "--status",
         choices=["queued", "in_progress", "completed", "failed"],
@@ -56,14 +56,14 @@ def main():
 
     # claim command
     claim_parser = subparsers.add_parser("claim", help="Claim a task")
-    claim_parser.add_argument("queue", help="Path to queue file")
+    claim_parser.add_argument("queue", help="Path to queue SQLite database")
     claim_parser.add_argument("task_id", nargs="?", help="Task ID to claim (defaults to first queued task)")
     claim_parser.add_argument("--agent", help="Agent claiming the task")
     claim_parser.add_argument("--json", action="store_true", help="Output JSON format")
 
     # complete command
     complete_parser = subparsers.add_parser("complete", help="Complete a task")
-    complete_parser.add_argument("queue", help="Path to queue file")
+    complete_parser.add_argument("queue", help="Path to queue SQLite database")
     complete_parser.add_argument("task_id", help="Task ID to complete")
     complete_parser.add_argument("--summary", default="", help="Completion summary")
     complete_parser.add_argument("--routing", required=True, choices=["archive", "qa-gate", "review", "escalate"], help="Routing action")
@@ -72,20 +72,20 @@ def main():
 
     # fail command
     fail_parser = subparsers.add_parser("fail", help="Fail a task")
-    fail_parser.add_argument("queue", help="Path to queue file")
+    fail_parser.add_argument("queue", help="Path to queue SQLite database")
     fail_parser.add_argument("task_id", help="Task ID to fail")
     fail_parser.add_argument("--error", default="", help="Error message")
     fail_parser.add_argument("--json", action="store_true", help="Output JSON format")
 
     # retry command
     retry_parser = subparsers.add_parser("retry", help="Retry a failed task")
-    retry_parser.add_argument("queue", help="Path to queue file")
+    retry_parser.add_argument("queue", help="Path to queue SQLite database")
     retry_parser.add_argument("task_id", help="Task ID to retry")
     retry_parser.add_argument("--json", action="store_true", help="Output JSON format")
 
     # stale command
     stale_parser = subparsers.add_parser("stale", help="List stale tasks")
-    stale_parser.add_argument("queue", help="Path to queue file")
+    stale_parser.add_argument("queue", help="Path to queue SQLite database")
     stale_parser.add_argument("--days", type=int, default=3, help="Days before stale")
     stale_parser.add_argument("--json", action="store_true", help="Output JSON format")
 

@@ -1,7 +1,7 @@
 """
-TaskMesh — Clean reference implementation for agent task queue operations.
+TaskMesh — SQLite-backed reference implementation for agent task queues.
 
-Public API for atomic, file-lock-based operations on JSON queue files.
+Public API for atomic operations on single-file SQLite queue databases.
 """
 
 from .queue_io import (
@@ -48,7 +48,7 @@ class Queue:
         return read_queue(self.queue_path)
 
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "Queue",
