@@ -16,6 +16,7 @@ Protocol:
 import json
 import os
 import sqlite3
+from contextlib import closing
 from datetime import datetime, timezone, timedelta
 from typing import Any, Callable, Dict, List, Optional
 
@@ -40,7 +41,13 @@ CREATE TABLE IF NOT EXISTS tasks (
     context TEXT,
     deliverable TEXT,
     depends_on TEXT,
+    not_before TEXT,
+    blocked_by TEXT,
     gate_condition TEXT,
+    source_channel TEXT,
+    source_session_key TEXT,
+    source_message_id TEXT,
+    mirror_channels TEXT,
     started_at TEXT,
     claimed_by TEXT,
     completed_at TEXT,
@@ -62,7 +69,7 @@ CREATE INDEX IF NOT EXISTS idx_tasks_status_queued_at ON tasks(status, queued_at
 def read_queue(queue_path: str) -> Dict[str, List[Dict[str, Any]]]:
     """Read queue state from SQLite."""
     try:
-        with _connect(queue_path) as conn:
+        with closing(_connect(queue_path)) as conn:
             return _read_queue_from_conn(conn)
     except sqlite3.DatabaseError:
         return _empty_queue()
@@ -75,7 +82,7 @@ def update_queue(queue_path: str, updater_fn: Callable[[Dict], None]) -> Dict:
     This preserves the previous public escape hatch while keeping SQLite as the
     canonical backend.
     """
-    with _connect(queue_path) as conn:
+    with closing(_connect(queue_path)) as conn:
         conn.execute("BEGIN IMMEDIATE")
         q = _read_queue_from_conn(conn)
         updater_fn(q)
@@ -94,7 +101,7 @@ def add(queue_path: str, task: Dict[str, Any], *, allow_requeue: bool = False) -
     if task["status"] != "queued":
         raise ValueError("Newly added tasks must have status 'queued'")
 
-    with _connect(queue_path) as conn:
+    with closing(_connect(queue_path)) as conn:
         conn.execute("BEGIN IMMEDIATE")
         existing = _get_task(conn, task["id"])
         if existing is not None:
@@ -110,7 +117,7 @@ def add(queue_path: str, task: Dict[str, Any], *, allow_requeue: bool = False) -
 
 def claim(queue_path: str, task_id: Optional[str] = None, *, agent: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Transition task from queued to in_progress."""
-    with _connect(queue_path) as conn:
+    with closing(_connect(queue_path)) as conn:
         conn.execute("BEGIN IMMEDIATE")
 
         if task_id is None:
@@ -158,7 +165,7 @@ def complete(
         raise ValueError("Completed tasks must include routing")
     _validate_routing(routing)
 
-    with _connect(queue_path) as conn:
+    with closing(_connect(queue_path)) as conn:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
             "SELECT * FROM tasks WHERE id = ? AND status = 'in_progress'",
@@ -196,7 +203,7 @@ def complete(
 
 def fail(queue_path: str, task_id: str, error: str = "") -> Optional[Dict[str, Any]]:
     """Transition task from in_progress to failed."""
-    with _connect(queue_path) as conn:
+    with closing(_connect(queue_path)) as conn:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
             "SELECT * FROM tasks WHERE id = ? AND status = 'in_progress'",
@@ -225,7 +232,7 @@ def fail(queue_path: str, task_id: str, error: str = "") -> Optional[Dict[str, A
 
 def retry(queue_path: str, task_id: str) -> Optional[Dict[str, Any]]:
     """Transition task from failed back to queued for retry."""
-    with _connect(queue_path) as conn:
+    with closing(_connect(queue_path)) as conn:
         conn.execute("BEGIN IMMEDIATE")
         task = _get_task(conn, task_id)
         if task is None or task.get("status") != "failed":
@@ -263,7 +270,7 @@ def retry(queue_path: str, task_id: str) -> Optional[Dict[str, Any]]:
 
 def list_tasks(queue_path: str, status: Optional[str] = None) -> List[Dict[str, Any]]:
     """List all tasks, optionally filtered by status."""
-    with _connect(queue_path) as conn:
+    with closing(_connect(queue_path)) as conn:
         if status:
             rows = conn.execute(
                 "SELECT * FROM tasks WHERE status = ? ORDER BY rowid",
@@ -294,7 +301,7 @@ def is_stale(task: Dict[str, Any], days: int = 3) -> bool:
 
 def is_duplicate(queue_path: str, task_id: str, *, include_terminal: bool = True) -> bool:
     """Check if task ID already exists in queue sections."""
-    with _connect(queue_path) as conn:
+    with closing(_connect(queue_path)) as conn:
         if include_terminal:
             row = conn.execute("SELECT 1 FROM tasks WHERE id = ? LIMIT 1", (task_id,)).fetchone()
         else:
@@ -331,6 +338,7 @@ def _open_db(queue_path: str, recover: bool) -> sqlite3.Connection:
         conn.execute("PRAGMA busy_timeout=10000")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.executescript(SCHEMA_SQL)
+        _ensure_schema_columns(conn)
         conn.execute("INSERT OR IGNORE INTO metadata(key, value) VALUES ('version', '1')")
         conn.execute("INSERT OR IGNORE INTO metadata(key, value) VALUES ('agent', NULL)")
         return conn
@@ -385,11 +393,13 @@ def _insert_task(conn: sqlite3.Connection, task: Dict[str, Any]) -> None:
         """
         INSERT INTO tasks (
             id, title, status, priority, queued_by, queued_at,
-            context, deliverable, depends_on, gate_condition,
+            context, deliverable, depends_on, not_before, blocked_by,
+            gate_condition, source_channel, source_session_key,
+            source_message_id, mirror_channels,
             started_at, claimed_by, completed_at, last_activity,
             stale_days, retry_count, max_retries, result, error,
             routing_action, routing_reason
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             record["id"],
@@ -401,7 +411,13 @@ def _insert_task(conn: sqlite3.Connection, task: Dict[str, Any]) -> None:
             record["context"],
             record["deliverable"],
             record["depends_on"],
+            record["not_before"],
+            record["blocked_by"],
             record["gate_condition"],
+            record["source_channel"],
+            record["source_session_key"],
+            record["source_message_id"],
+            record["mirror_channels"],
             record["started_at"],
             record["claimed_by"],
             record["completed_at"],
@@ -439,6 +455,14 @@ def _task_to_record(task: Dict[str, Any]) -> Dict[str, Any]:
     if depends_on is not None and not isinstance(depends_on, list):
         raise ValueError("dependsOn must be a list when provided")
 
+    blocked_by = task.get("blockedBy")
+    if blocked_by is not None and not isinstance(blocked_by, list):
+        raise ValueError("blockedBy must be a list when provided")
+
+    mirror_channels = task.get("mirrorChannels")
+    if mirror_channels is not None and not isinstance(mirror_channels, list):
+        raise ValueError("mirrorChannels must be a list when provided")
+
     return {
         "id": task["id"],
         "title": task["title"],
@@ -449,7 +473,13 @@ def _task_to_record(task: Dict[str, Any]) -> Dict[str, Any]:
         "context": task.get("context"),
         "deliverable": task.get("deliverable"),
         "depends_on": json.dumps(depends_on) if depends_on is not None else None,
+        "not_before": task.get("notBefore"),
+        "blocked_by": json.dumps(blocked_by) if blocked_by is not None else None,
         "gate_condition": task.get("gateCondition"),
+        "source_channel": task.get("sourceChannel"),
+        "source_session_key": task.get("sourceSessionKey"),
+        "source_message_id": task.get("sourceMessageId"),
+        "mirror_channels": json.dumps(mirror_channels) if mirror_channels is not None else None,
         "started_at": task.get("startedAt"),
         "claimed_by": task.get("claimedBy"),
         "completed_at": task.get("completedAt"),
@@ -477,7 +507,11 @@ def _row_to_task(row: sqlite3.Row) -> Dict[str, Any]:
         "queued_at": "queuedAt",
         "context": "context",
         "deliverable": "deliverable",
+        "not_before": "notBefore",
         "gate_condition": "gateCondition",
+        "source_channel": "sourceChannel",
+        "source_session_key": "sourceSessionKey",
+        "source_message_id": "sourceMessageId",
         "started_at": "startedAt",
         "claimed_by": "claimedBy",
         "completed_at": "completedAt",
@@ -500,6 +534,10 @@ def _row_to_task(row: sqlite3.Row) -> Dict[str, Any]:
 
     if row["depends_on"]:
         task["dependsOn"] = json.loads(row["depends_on"])
+    if row["blocked_by"]:
+        task["blockedBy"] = json.loads(row["blocked_by"])
+    if row["mirror_channels"]:
+        task["mirrorChannels"] = json.loads(row["mirror_channels"])
 
     if row["routing_action"] is not None:
         task["routing"] = {
@@ -508,6 +546,21 @@ def _row_to_task(row: sqlite3.Row) -> Dict[str, Any]:
         }
 
     return task
+
+
+def _ensure_schema_columns(conn: sqlite3.Connection) -> None:
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+    additions = {
+        "not_before": "TEXT",
+        "blocked_by": "TEXT",
+        "source_channel": "TEXT",
+        "source_session_key": "TEXT",
+        "source_message_id": "TEXT",
+        "mirror_channels": "TEXT",
+    }
+    for column, column_type in additions.items():
+        if column not in existing:
+            conn.execute(f"ALTER TABLE tasks ADD COLUMN {column} {column_type}")
 
 
 def _now_iso() -> str:
