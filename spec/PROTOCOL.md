@@ -1,7 +1,7 @@
 # TaskMesh Protocol
 
-> Version: 0.2-release-candidate
-> Status: Release candidate
+> Version: 0.3.0
+> Status: Public working spec
 
 ---
 
@@ -15,6 +15,8 @@ It standardizes:
 - state transitions
 - deduplication behavior
 - routing declarations on completion
+- origin-aware lifecycle metadata
+- dependency-gate metadata
 - stale-task detection inputs
 
 The goal is to provide a queue contract that can be adopted by orchestrators, agents, or lightweight local runtimes without requiring external queue infrastructure.
@@ -41,7 +43,13 @@ All tasks MUST conform to this schema.
 | `context` | string | Background context for the executing agent |
 | `deliverable` | string | Expected output description |
 | `dependsOn` | string[] | Task IDs that must complete before this runs |
+| `notBefore` | ISO-8601 string | Earliest timestamp when the task may be dispatched |
+| `blockedBy` | string[] | Task IDs, gates, or external prerequisites currently holding dispatch |
 | `gateCondition` | string | Human-readable prerequisite for dispatch |
+| `sourceChannel` | string | Origin channel, chat, or route where lifecycle notifications should return |
+| `sourceSessionKey` | string | Origin session identifier, when known |
+| `sourceMessageId` | string | Origin message identifier, when known |
+| `mirrorChannels` | string[] | Additional channels or routes that should receive lifecycle notifications |
 | `startedAt` | ISO-8601 string | Timestamp when the task was claimed |
 | `claimedBy` | string | Agent or worker that claimed the task |
 | `completedAt` | ISO-8601 string | Timestamp when the task completed or failed |
@@ -211,23 +219,60 @@ Default `staleDays` is 3 when no override is present.
 
 ---
 
-## 9. Gate Conditions
+## 9. Origin-Aware Lifecycle Routing
 
-Tasks MAY declare a `gateCondition` describing a prerequisite that must be satisfied before dispatch.
+Queue entries MAY carry origin metadata so a queue can send lifecycle updates back to the place where work was requested.
+
+```json
+{
+  "sourceChannel": "discord:1489064609355927632",
+  "sourceSessionKey": "session:agent-queue",
+  "sourceMessageId": "1501269514405412904",
+  "mirrorChannels": ["discord:ops-log"]
+}
+```
+
+### Resolution Rules
+- `sourceChannel` is the default destination for routine lifecycle events
+- `mirrorChannels` receive copies only when explicitly requested by the producer
+- Explicit escalation or review targets MAY override routine source routing
+- Missing origin metadata MUST NOT prevent queue operations
+- Implementations SHOULD avoid sending duplicate notifications for the same task and event type
+
+### Lifecycle Events
+Implementations MAY emit lifecycle events for:
+- task added
+- task claimed
+- task completed
+- task failed
+- task became stale
+- task became dispatch-blocked by a gate or dependency
+
+The protocol defines the metadata contract. Notification transport, formatting, and retry behavior are implementation concerns.
+
+---
+
+## 10. Gate Conditions And Dependencies
+
+Tasks MAY declare prerequisites that must be satisfied before dispatch.
 
 Example:
 
 ```json
 {
+  "dependsOn": ["research-market-001"],
+  "notBefore": "2026-05-05T18:00:00+00:00",
   "gateCondition": "Only dispatch after migration validation passes"
 }
 ```
 
-Gate evaluation is an orchestrator concern. The queue protocol stores the condition, but does not define an automated evaluator.
+Dependency and gate evaluation are orchestrator concerns. The queue protocol stores the condition, but does not define an automated evaluator.
+
+If a task is not dispatchable because a prerequisite is unsatisfied, implementations MAY store `blockedBy` to explain the wait. A dependency wait is not a failure by itself.
 
 ---
 
-## 10. Reference API Surface
+## 11. Reference API Surface
 
 A compliant Python implementation may expose both:
 
@@ -249,6 +294,7 @@ Implementations MAY expose a grouped `read_queue()` view for human inspection or
 
 ## Changelog
 
+- `0.3.0` (2026-05-05) — Added origin-aware lifecycle metadata, mirror channels, dependency-gate fields, and SQLite schema migration for those optional fields
 - `0.2-release-candidate` (2026-04-09) — Canonicalized SQLite as the sole backend, retained grouped read adapter, and aligned concurrency language with transactional storage
 - `0.1-release-candidate` (2026-04-06) — Canonicalized routing object, claim metadata, dedup semantics, and reference API
 - `0.1-draft` (2026-04-01) — Initial spec draft

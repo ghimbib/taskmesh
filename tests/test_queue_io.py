@@ -598,14 +598,73 @@ class TestEdgeCases(unittest.TestCase):
         task["context"] = "Some context"
         task["deliverable"] = "A file"
         task["dependsOn"] = ["other-001"]
+        task["notBefore"] = "2026-05-05T18:00:00+00:00"
+        task["blockedBy"] = ["gate:approval"]
         task["gateCondition"] = "Wait for approval"
+        task["sourceChannel"] = "discord:1489064609355927632"
+        task["sourceSessionKey"] = "session:agent-queue"
+        task["sourceMessageId"] = "1501269514405412904"
+        task["mirrorChannels"] = ["discord:ops-log"]
         task["staleDays"] = 7
         queue_io.add(self.qpath, task)
         queue_io.claim(self.qpath, "edge-002")
         result = queue_io.complete(self.qpath, "edge-002", "done", routing={"action": "review", "reason": "optional fields verified"})
         self.assertEqual(result["context"], "Some context")
         self.assertEqual(result["dependsOn"], ["other-001"])
+        self.assertEqual(result["notBefore"], "2026-05-05T18:00:00+00:00")
+        self.assertEqual(result["blockedBy"], ["gate:approval"])
+        self.assertEqual(result["gateCondition"], "Wait for approval")
+        self.assertEqual(result["sourceChannel"], "discord:1489064609355927632")
+        self.assertEqual(result["sourceSessionKey"], "session:agent-queue")
+        self.assertEqual(result["sourceMessageId"], "1501269514405412904")
+        self.assertEqual(result["mirrorChannels"], ["discord:ops-log"])
         self.assertEqual(result["staleDays"], 7)
+
+    def test_optional_list_fields_validate_type(self):
+        for field in ("dependsOn", "blockedBy", "mirrorChannels"):
+            task = _make_task(f"bad-{field}")
+            task[field] = "not-a-list"
+            with self.assertRaises(ValueError):
+                queue_io.add(self.qpath, task)
+
+    def test_schema_migrates_existing_database(self):
+        qpath = os.path.join(self.tmpdir, "old-schema.db")
+        conn = queue_io._open_db(qpath, recover=False)
+        conn.execute("ALTER TABLE tasks RENAME TO tasks_newer")
+        conn.execute(
+            """
+            CREATE TABLE tasks (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('queued', 'in_progress', 'completed', 'failed')),
+                priority TEXT,
+                queued_by TEXT,
+                queued_at TEXT,
+                context TEXT,
+                deliverable TEXT,
+                depends_on TEXT,
+                gate_condition TEXT,
+                started_at TEXT,
+                claimed_by TEXT,
+                completed_at TEXT,
+                last_activity TEXT,
+                stale_days INTEGER,
+                retry_count INTEGER,
+                max_retries INTEGER,
+                result TEXT,
+                error TEXT,
+                routing_action TEXT,
+                routing_reason TEXT
+            )
+            """
+        )
+        conn.execute("DROP TABLE tasks_newer")
+        conn.close()
+
+        task = _make_task("migrate-001")
+        task["sourceChannel"] = "discord:test"
+        self.assertTrue(queue_io.add(qpath, task))
+        self.assertEqual(queue_io.claim(qpath, "migrate-001")["sourceChannel"], "discord:test")
 
 
 if __name__ == "__main__":

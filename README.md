@@ -8,7 +8,7 @@ Most multi-agent AI systems bolt on task coordination as an afterthought: ad hoc
 
 ## What it includes
 
-1. **Protocol spec** for task schema, lifecycle, deduplication, retries, and completion routing
+1. **Protocol spec** for task schema, lifecycle, deduplication, retries, origin metadata, and completion routing
 2. **Python reference implementation** using SQLite transactions and WAL mode
 3. **CLI** for queue operations
 4. **Tests** covering lifecycle, retries, stale detection, and concurrent writers
@@ -61,6 +61,8 @@ TaskMesh stores queue state in a **SQLite database**.
   "queuedBy": "orchestrator",
   "queuedAt": "2026-04-06T16:00:00+00:00",
   "priority": "P1",
+  "sourceChannel": "discord:1489064609355927632",
+  "dependsOn": ["research-market-001"],
   "context": "Compare top 3 competitors",
   "deliverable": "Short markdown summary"
 }
@@ -84,6 +86,21 @@ Valid routing actions:
 - `qa-gate`
 - `review`
 - `escalate`
+
+### Origin-aware lifecycle metadata
+
+Tasks may include origin metadata so lifecycle updates can return to the request surface:
+
+```json
+{
+  "sourceChannel": "discord:1489064609355927632",
+  "sourceSessionKey": "session:agent-queue",
+  "sourceMessageId": "1501269514405412904",
+  "mirrorChannels": ["discord:ops-log"]
+}
+```
+
+Routine queue events should default to `sourceChannel`. `mirrorChannels` are explicit copies. Escalation and review routing can still override routine lifecycle delivery.
 
 ---
 
@@ -204,15 +221,18 @@ taskmesh stale ./queue.db --days 3
 - Claim operations record timestamps and may record claimant identity
 - Retry clears completion-only fields before re-queueing
 - SQLite WAL mode is enabled for concurrent local writers
+- Optional origin and dependency fields survive task lifecycle transitions
 
 ---
 
 ## Current status
 
-Current release candidate includes:
+Current `v0.3.0` includes:
 - spec-aligned Python API
 - spec-aligned CLI
 - routing stored as structured task metadata
+- origin-aware lifecycle metadata in the protocol and SQLite reference implementation
+- dependency-gate metadata in the protocol and SQLite reference implementation
 - concurrent write tests
 - retry and stale detection coverage
 - SQLite as the canonical backend
@@ -221,7 +241,7 @@ Current release candidate includes:
 
 ## Roadmap
 
-- package metadata and PyPI publishing
+- PyPI publishing
 - more worked examples
 - migration helpers for older file-based prototypes
 - TypeScript port
